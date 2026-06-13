@@ -79,6 +79,76 @@ def _score_recipe(
     return (score, reason)
 
 
+def _whole_package_servings_for_dinner(
+    conn: sqlite3.Connection,
+    recipe_id: int,
+    base_servings: float,
+) -> tuple[float, str | None]:
+    best: tuple[float, float, str] | None = None
+    ingredients = _recipe_ingredients(conn, recipe_id)
+    protein_rows = [
+        row
+        for row in ingredients
+        if row["required"] and row["category"] in {"肉类", "鱼虾"}
+    ]
+    for ingredient in protein_rows:
+        quantity_per_serving = float(ingredient["quantity_per_serving"])
+        if quantity_per_serving <= 0:
+            continue
+        base_needed = quantity_per_serving * base_servings
+        batches = conn.execute(
+            """
+            SELECT quantity, unit
+            FROM inventory_items
+            WHERE ingredient_id = ?
+              AND status = 'available'
+              AND quantity > 0
+              AND unit = ?
+            ORDER BY expiry_date IS NULL, expiry_date, purchase_date
+            """,
+            (ingredient["ingredient_id"], ingredient["unit"]),
+        ).fetchall()
+        if not batches:
+            continue
+
+        quantities = [float(batch["quantity"]) for batch in batches]
+        candidates = quantities + [sum(quantities)]
+        for candidate_quantity in candidates:
+            if candidate_quantity <= 0:
+                continue
+            adjusted_servings = round(candidate_quantity / quantity_per_serving, 2)
+            if adjusted_servings < base_servings * 0.75:
+                continue
+            if adjusted_servings > base_servings * 2.25:
+                continue
+
+            # Prefer enough food, then the closest whole-package match.
+            under_penalty = base_needed * 0.5 if candidate_quantity < base_needed * 0.9 else 0
+            all_batches_bonus = -base_needed * 0.08 if candidate_quantity == sum(quantities) and len(quantities) > 1 else 0
+            distance = abs(candidate_quantity - base_needed) + under_penalty + all_batches_bonus
+            reason = (
+                f"晚餐整份食材：{ingredient['name']} 按 {candidate_quantity:g}{ingredient['unit']} "
+                f"调整为 {adjusted_servings:g} 人份"
+            )
+            if best is None or distance < best[0]:
+                best = (distance, adjusted_servings, reason)
+
+    if best is None:
+        return base_servings, None
+    return best[1], best[2]
+
+
+def _planned_servings_for_recipe(
+    conn: sqlite3.Connection,
+    recipe_id: int,
+    meal_slot: str,
+    base_servings: float,
+) -> tuple[float, str | None]:
+    if meal_slot != "dinner":
+        return base_servings, None
+    return _whole_package_servings_for_dinner(conn, recipe_id, base_servings)
+
+
 def generate_weekly_plan(conn: sqlite3.Connection, week_start: str) -> int:
     servings = household_portion_units()
     plan_name = "default"
@@ -117,13 +187,18 @@ def generate_weekly_plan(conn: sqlite3.Connection, week_start: str) -> int:
             used_counts[recipe_id] += 1
             if best_score < -100:
                 reason = "没有完全符合偏好的菜谱，暂用最低风险候选"
+            planned_servings, servings_reason = _planned_servings_for_recipe(
+                conn, recipe_id, slot, servings
+            )
+            if servings_reason:
+                reason = f"{reason}；{servings_reason}"
             conn.execute(
                 """
                 INSERT INTO meal_plan_items
                 (meal_plan_id, meal_date, meal_slot, recipe_id, planned_servings, priority_reason)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (plan_id, meal_date, slot, recipe_id, servings, reason),
+                (plan_id, meal_date, slot, recipe_id, planned_servings, reason),
             )
 
     update_times_planned(conn)

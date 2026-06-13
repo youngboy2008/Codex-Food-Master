@@ -36,7 +36,7 @@ def estimate_portion_factor(age: int, gender: str | None = None) -> float:
     if age <= 12:
         return 0.65
     if age <= 17:
-        return 0.85
+        return 1.2
     if age >= 65:
         return 0.9
     if gender == "男":
